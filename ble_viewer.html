@@ -1,0 +1,249 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Robot BLE Monitor</title>
+<!--
+  Wireless serial monitor for the ECE 5 line follower.
+  Open this file in Google Chrome (or Edge) on your laptop. Safari/Firefox do not support Web Bluetooth.
+  macOS: System Settings > Privacy & Security > Bluetooth must allow Google Chrome.
+-->
+<style>
+  :root {
+    --bg: #f6f7f9; --panel: #ffffff; --text: #1b1f24; --muted: #5f6b7a; --border: #d9dee5;
+    --accent: #2563eb; --err: #d9480f; --lm: #2b8a3e; --rm: #7048e8; --grid: #e7ebf0;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root:not([data-theme="light"]) {
+      --bg: #111418; --panel: #1a1f25; --text: #e6e9ed; --muted: #95a1ae; --border: #2c333c;
+      --accent: #5b8def; --err: #ff8a4c; --lm: #51cf66; --rm: #a78bfa; --grid: #252b33;
+    }
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--text);
+         font: 14px/1.4 -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }
+  main { max-width: 1100px; margin: 0 auto; padding: 16px; display: grid; gap: 12px; }
+  header { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; }
+  h1 { font-size: 18px; margin: 0 auto 0 0; }
+  button { font: inherit; padding: 6px 14px; border-radius: 6px; border: 1px solid var(--border);
+           background: var(--panel); color: var(--text); cursor: pointer; }
+  button.primary { background: var(--accent); border-color: var(--accent); color: #fff; }
+  button:disabled { opacity: .5; cursor: default; }
+  #status { color: var(--muted); }
+  .panel { background: var(--panel); border: 1px solid var(--border); border-radius: 8px; padding: 12px; }
+  .stats { display: grid; grid-template-columns: repeat(auto-fit, minmax(110px, 1fr)); gap: 8px; }
+  .stat .k { color: var(--muted); font-size: 12px; }
+  .stat .v { font-size: 22px; font-variant-numeric: tabular-nums; }
+  .bars { display: flex; gap: 6px; align-items: flex-end; height: 80px; margin-top: 8px; }
+  .bar { flex: 1; background: var(--grid); border-radius: 3px; position: relative; height: 100%; }
+  .bar > div { position: absolute; bottom: 0; left: 0; right: 0; background: var(--text); border-radius: 3px; }
+  .bar > span { position: absolute; top: -2px; left: 0; right: 0; text-align: center; font-size: 11px; color: var(--muted); }
+  canvas { width: 100%; height: 180px; display: block; }
+  .legend { display: flex; gap: 14px; font-size: 12px; color: var(--muted); margin-bottom: 4px; }
+  .legend i { display: inline-block; width: 10px; height: 3px; vertical-align: middle; margin-right: 4px; }
+  #log { height: 260px; overflow: auto; margin: 0; font: 12px/1.35 ui-monospace, Menlo, monospace; white-space: pre; }
+  .row2 { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
+  @media (max-width: 700px) { .row2 { grid-template-columns: 1fr; } }
+</style>
+</head>
+<body>
+<main>
+  <header>
+    <h1>Robot BLE Monitor</h1>
+    <span id="status">Not connected</span>
+    <button id="connect" class="primary">Connect</button>
+    <button id="disconnect" disabled>Disconnect</button>
+    <button id="pause">Pause</button>
+    <button id="save">Save CSV</button>
+    <button id="clear">Clear</button>
+  </header>
+
+  <section class="panel stats">
+    <div class="stat"><div class="k">Speed (Sp)</div><div class="v" id="v-Sp">–</div></div>
+    <div class="stat"><div class="k">kP</div><div class="v" id="v-P">–</div></div>
+    <div class="stat"><div class="k">kI</div><div class="v" id="v-I">–</div></div>
+    <div class="stat"><div class="k">kD</div><div class="v" id="v-D">–</div></div>
+    <div class="stat"><div class="k">Error</div><div class="v" id="v-Err">–</div></div>
+    <div class="stat"><div class="k">Left motor</div><div class="v" id="v-LMotor">–</div></div>
+    <div class="stat"><div class="k">Right motor</div><div class="v" id="v-RMotor">–</div></div>
+    <div class="stat"><div class="k">Lines / sec</div><div class="v" id="v-rate">–</div></div>
+  </section>
+
+  <div class="row2">
+    <section class="panel">
+      <div class="legend"><span><i style="background:var(--err)"></i>Error (−4 … 4)</span></div>
+      <canvas id="plotErr"></canvas>
+    </section>
+    <section class="panel">
+      <div class="legend">
+        <span><i style="background:var(--lm)"></i>Left motor</span>
+        <span><i style="background:var(--rm)"></i>Right motor</span>
+        <span>(−255 … 255)</span>
+      </div>
+      <canvas id="plotMot"></canvas>
+    </section>
+  </div>
+
+  <section class="panel">
+    <div class="legend"><span>Photoresistors, left → right (0 = white, 100 = black)</span></div>
+    <div class="bars" id="bars"></div>
+  </section>
+
+  <section class="panel"><pre id="log"></pre></section>
+</main>
+
+<script>
+const NUS_SERVICE = '6e400001-b5a3-f393-e0a9-e50e24dcca9e';
+const NUS_TX      = '6e400003-b5a3-f393-e0a9-e50e24dcca9e';
+const HISTORY = 200;          // samples shown in the plots (10 s at 20 Hz)
+const MAX_LOG_LINES = 500;
+
+const $ = id => document.getElementById(id);
+let device = null, paused = false, partial = '';
+let samples = [];             // parsed telemetry rows, for plots + CSV
+let csvRows = [], csvHeader = null;
+let logLines = [], linesThisSecond = 0;
+const decoder = new TextDecoder();
+
+function setStatus(s) { $('status').textContent = s; }
+
+$('connect').onclick = async () => {
+  if (!navigator.bluetooth) {
+    setStatus('Web Bluetooth not available: use Chrome or Edge');
+    return;
+  }
+  try {
+    device = await navigator.bluetooth.requestDevice({ filters: [{ services: [NUS_SERVICE] }] });
+    device.addEventListener('gattserverdisconnected', onDisconnected);
+    await connectGatt();
+  } catch (e) { setStatus('Error: ' + e.message); }
+};
+
+async function connectGatt() {
+  setStatus('Connecting to ' + device.name + '…');
+  const server = await device.gatt.connect();
+  const service = await server.getPrimaryService(NUS_SERVICE);
+  const tx = await service.getCharacteristic(NUS_TX);
+  tx.addEventListener('characteristicvaluechanged', ev => onData(ev.target.value));
+  await tx.startNotifications();
+  setStatus('Connected: ' + device.name);
+  $('connect').disabled = true; $('disconnect').disabled = false;
+}
+
+function onDisconnected() {
+  setStatus('Disconnected, retrying…');
+  $('connect').disabled = false; $('disconnect').disabled = true;
+  // auto-reconnect (e.g. robot drove out of range and came back)
+  setTimeout(() => { if (device && !device.gatt.connected) connectGatt().catch(() => setStatus('Disconnected')); }, 1000);
+}
+
+$('disconnect').onclick = () => {
+  if (device) {
+    device.removeEventListener('gattserverdisconnected', onDisconnected);
+    device.gatt.disconnect();
+  }
+  device = null; setStatus('Not connected');
+  $('connect').disabled = false; $('disconnect').disabled = true;
+};
+
+$('pause').onclick = () => { paused = !paused; $('pause').textContent = paused ? 'Resume' : 'Pause'; };
+$('clear').onclick = () => { logLines = []; samples = []; csvRows = []; csvHeader = null; $('log').textContent = ''; draw(); };
+$('save').onclick = () => {
+  if (!csvHeader) return;
+  const text = [csvHeader.join(','), ...csvRows.map(r => r.join(','))].join('\n');
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(new Blob([text], { type: 'text/csv' }));
+  a.download = 'robot_telemetry_' + new Date().toISOString().replace(/[:.]/g, '-') + '.csv';
+  a.click();
+};
+
+function onData(dataView) {
+  partial += decoder.decode(dataView, { stream: true });
+  let nl;
+  while ((nl = partial.indexOf('\n')) >= 0) {
+    handleLine(partial.slice(0, nl).replace(/\r$/, ''));
+    partial = partial.slice(nl + 1);
+  }
+}
+
+function handleLine(line) {
+  linesThisSecond++;
+  if (!paused) {
+    logLines.push(line);
+    if (logLines.length > MAX_LOG_LINES) logLines.splice(0, logLines.length - MAX_LOG_LINES);
+  }
+  // Telemetry lines look like "Sp:50,P:20.00,I:0.010,D:0.10,L0:3,...,Err:-1.00,LMotor:120,RMotor:80"
+  if (!line.startsWith('Sp:')) return;
+  const row = {};
+  for (const part of line.split(',')) {
+    const i = part.indexOf(':');
+    if (i > 0) row[part.slice(0, i)] = parseFloat(part.slice(i + 1));
+  }
+  row.t = performance.now() / 1000;
+  const keys = Object.keys(row);
+  if (!csvHeader || csvHeader.length !== keys.length) { csvHeader = keys; csvRows = []; }
+  csvRows.push(csvHeader.map(k => row[k]));
+  if (paused) return;
+  samples.push(row);
+  if (samples.length > HISTORY) samples.shift();
+}
+
+// Redraw at screen refresh rate (not on every packet)
+function frame() {
+  if (!paused) {
+    $('log').textContent = logLines.join('\n');
+    $('log').scrollTop = $('log').scrollHeight;
+    draw();
+  }
+  requestAnimationFrame(frame);
+}
+
+function draw() {
+  const last = samples[samples.length - 1];
+  for (const k of ['Sp', 'P', 'I', 'D', 'Err', 'LMotor', 'RMotor'])
+    $('v-' + k).textContent = last && k in last ? last[k] : '–';
+
+  // photoresistor bars
+  const bars = $('bars');
+  const ldrKeys = last ? Object.keys(last).filter(k => /^L\d+$/.test(k)) : [];
+  if (bars.children.length !== ldrKeys.length) {
+    bars.innerHTML = ldrKeys.map(() => '<div class="bar"><div></div><span></span></div>').join('');
+  }
+  ldrKeys.forEach((k, i) => {
+    const v = last[k], pct = Math.max(0, Math.min(100, v));
+    bars.children[i].firstChild.style.height = pct + '%';
+    bars.children[i].lastChild.textContent = v;
+  });
+
+  plot($('plotErr'), [['Err', 'err']], -4, 4);
+  plot($('plotMot'), [['LMotor', 'lm'], ['RMotor', 'rm']], -255, 255);
+}
+
+function plot(canvas, series, lo, hi) {
+  const dpr = window.devicePixelRatio || 1;
+  const w = canvas.clientWidth, h = canvas.clientHeight;
+  if (canvas.width !== w * dpr) { canvas.width = w * dpr; canvas.height = h * dpr; }
+  const ctx = canvas.getContext('2d');
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  ctx.clearRect(0, 0, w, h);
+  const css = getComputedStyle(document.documentElement);
+  const y = v => h - ((v - lo) / (hi - lo)) * h;
+  ctx.strokeStyle = css.getPropertyValue('--grid'); ctx.lineWidth = 1;
+  ctx.beginPath(); ctx.moveTo(0, y(0)); ctx.lineTo(w, y(0)); ctx.stroke();   // zero line
+  for (const [key, color] of series) {
+    ctx.strokeStyle = css.getPropertyValue('--' + color); ctx.lineWidth = 2;
+    ctx.beginPath();
+    samples.forEach((s, i) => {
+      const x = (i / (HISTORY - 1)) * w, yy = y(Math.max(lo, Math.min(hi, s[key])));
+      i ? ctx.lineTo(x, yy) : ctx.moveTo(x, yy);
+    });
+    ctx.stroke();
+  }
+}
+
+setInterval(() => { $('v-rate').textContent = linesThisSecond; linesThisSecond = 0; }, 1000);
+requestAnimationFrame(frame);
+</script>
+</body>
+</html>

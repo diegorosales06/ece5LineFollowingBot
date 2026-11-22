@@ -37,9 +37,18 @@
 // ************************************************************************************************* //
 // Change Robot Settings here
 
-#define PRINTALLDATA        1  // Turn to 1  to prints ALL the data when changed to 1, Could be useful for debugging =)
-                                // !! Turn to 0 when running robot untethered
+#define PRINTALLDATA        0  // 1 = send debug data (gains, sensors, error, motor speeds). Safe to leave on untethered:
+                                //     it is rate-limited and never blocks the PID loop.
+#define USB_PRINT           1  // 1 = also print to the USB Serial Monitor / Serial Plotter (when plugged in)
+#define BLE_TELEMETRY       1  // 1 = also send wirelessly over Bluetooth LE (see BleTelemetry.h / ble_viewer.html)
+                                //     0 = Bluetooth is not compiled in at all
+#define TELEMETRY_PERIOD_MS 50 // send one line every 50 ms (20 lines/sec). The PID loop itself still runs at full speed.
+#define BLE_DEVICE_NAME     "ECE5-Robot" // name you'll see when connecting; change it so teams don't collide
 #define NOMINALSPEED        50 // This is the base speed for both motors, can also be increased by using potentiometers
+
+#if BLE_TELEMETRY
+#include "BleTelemetry.h"      // Wireless debug output (uses the ESP32 core's built-in BLE library, nothing to install)
+#endif
 
 // ************************************************************************************************* //
 
@@ -88,12 +97,23 @@ int Turn, M1P = 0, M2P = 0;
 float error, lasterror = 0, sumerror = 0;
 float kP, kI, kD;
 
+// For Debug Output
+char telemetryLine[200];   // one formatted line of debug data (fixed buffer, no String = fast & no heap churn)
+char calInfo[3][160];      // White / Black / Delta calibration lines, re-sent whenever Bluetooth connects
+
 
 
 // ************************************************************************************************* //
 // setup - runs once
 void setup() {
   Serial.begin(9600);                            // For serial communication set up
+#if ARDUINO_USB_CDC_ON_BOOT
+  Serial.setTxTimeoutMs(0);                      // never wait on USB when no computer is plugged in
+#endif
+
+#if BLE_TELEMETRY
+  bleTelemetryBegin(BLE_DEVICE_NAME);            // start advertising now so you can connect during calibration
+#endif
 
   for (int i = 0; i < numLEDs; i++)
     pinMode(led_Pins[i], OUTPUT);                // Initialize all LEDs to output
@@ -118,8 +138,8 @@ void loop() {
 
   RunMotors();          // Runs motors
   
-  if (PRINTALLDATA)     // If PRINTALLDATA Enabled, Print all the data
-    Print();         
+  if (PRINTALLDATA)     // If PRINTALLDATA Enabled, send the data (rate-limited, non-blocking)
+    Print();
 
   
   
@@ -159,22 +179,19 @@ void Calibrate() {
   DriveMotors.stopA();                          // then stop both motors
   DriveMotors.stopB();
 
-  Serial.print("White Vals:  ");
-  for (int i = 0; i < totalPhotoResistors; i++)
-    Serial.print(String(Mn[i]) + " ");          // Print the White values that will be used by the robot
-  Serial.println();
-
-  
-
-  Serial.print("Black Vals:  ");
-  for (int i = 0; i < totalPhotoResistors; i++)
-    Serial.print(String(Mx[i]) + " ");          // Print the Black values that will be used by the robot
-  Serial.println();
-
-  Serial.print("Delta Vals:  ");
-  for (int i = 0; i < totalPhotoResistors; i++)
-    Serial.print(String(Mx[i] - Mn[i]) + " ");  // Print the Difference between the White and Black valuess
-  Serial.println();
+  // Build the White / Black / Delta lines once, print them, and keep them so they can be
+  // re-sent over Bluetooth when you connect (calibration usually finishes before you connect).
+  const char *calLabels[3] = {"White Vals:  ", "Black Vals:  ", "Delta Vals:  "};
+  for (int row = 0; row < 3; row++) {
+    int len = snprintf(calInfo[row], sizeof(calInfo[row]), "%s", calLabels[row]);
+    for (int i = 0; i < totalPhotoResistors && len < (int)sizeof(calInfo[row]); i++) {
+      float v = (row == 0) ? Mn[i] : (row == 1) ? Mx[i] : (Mx[i] - Mn[i]); // White, Black, or Difference
+      len += snprintf(calInfo[row] + len, sizeof(calInfo[row]) - len, "%.0f ", v);
+    }
+    if (len < (int)sizeof(calInfo[row]) - 1)
+      strcat(calInfo[row], "\n");
+    DebugMsg(calInfo[row]);
+  }
 
   setLeds(1);                                   // Turn LEDs on
   delay(2000);
@@ -184,9 +201,9 @@ void Calibrate() {
 void CalibrateHelper(int numberOfMeasurements, boolean ifCalibratingBlack) {
   
   if (ifCalibratingBlack)
-    Serial.println("\nCalibrating Black");
+    DebugMsg("\nCalibrating Black\n");
   else
-    Serial.println("\nCalibrating White");
+    DebugMsg("\nCalibrating White\n");
 // Indicate that calibration is starting
   for (int i = 0; i < 4; i++) {
       setLeds(1); // turn the LEDs on
@@ -215,7 +232,7 @@ void CalibrateHelper(int numberOfMeasurements, boolean ifCalibratingBlack) {
     LDRf[pin] = 0.0;
   }
 
-  Serial.println(" Done!");
+  DebugMsg(" Done!\n");
   setLeds(0);
   delay(250);
 }
@@ -358,22 +375,59 @@ void PID_Turn() {
 } // end PID_Turn()
 
 // ************************************************************************************************* //
+// Send a one-off message (calibration status, etc.) to USB and/or Bluetooth
+void DebugMsg(const char *msg) {
+#if USB_PRINT
+  Serial.print(msg);
+#endif
+#if BLE_TELEMETRY
+  bleSend(msg);
+#endif
+}
+
+// ************************************************************************************************* //
 // function to print values of interest
+// Rate-limited by a millis() timer instead of delay(): the PID loop keeps running at full speed and
+// only one line is sent every TELEMETRY_PERIOD_MS. Format is "label:value" pairs, so the Arduino
+// Serial Plotter (USB) and ble_viewer.html (Bluetooth) can both graph it.
 void Print() {
-  Serial.print(" Sp: " + String(SpRead) + " P: " + String(kP) + " I: " + String(kI) + " D: " + String(kD) + "  PResistor Val : "); // Prints PID settings
+  static unsigned long lastSend = 0;
 
-  for (int i = 0; i < totalPhotoResistors; i++) { // Printing the photo resistor reading values one by one
-    Serial.print(LDR[i]);
-    //Serial.print(rawPResistorData[i]); //Uncomment this if you would prefer to see raw photoresistor readings
-    Serial.print(" ");
-  }
+#if BLE_TELEMETRY
+  if (bleConsumeNewConnection())                 // just connected? re-send the calibration results first
+    for (int row = 0; row < 3; row++)
+      bleSend(calInfo[row]);
+  bool bleWantsData = bleConnected();
+#else
+  bool bleWantsData = false;
+#endif
 
-  Serial.print(" Error: " + String(error));      // this will show the calculated error (-3 through 3)
+  if (!USB_PRINT && !bleWantsData)               // nobody listening, so skip the formatting work entirely
+    return;
 
-  Serial.println("  LMotor:  " + String(M1SpeedtoMotor) + "  RMotor:  " + String(M2SpeedtoMotor));    // This prints the arduino output to each motor so you can see what the values are (0-255)
-  setLeds(0); 
-  delay(100);                                    // just here to slow down the output for easier reading. Don't comment out or else it'll slow down the processor on the arduino
-  setLeds(1); 
-  delay(100); 
+  unsigned long now = millis();
+  if (now - lastSend < TELEMETRY_PERIOD_MS)      // not time yet, return immediately
+    return;
+  lastSend = now;
+
+  int len = snprintf(telemetryLine, sizeof(telemetryLine), "Sp:%d,P:%.2f,I:%.3f,D:%.2f", SpRead, kP, kI, kD); // PID settings
+
+  for (int i = 0; i < totalPhotoResistors && len < (int)sizeof(telemetryLine); i++)  // photoresistor values, L0 = leftmost
+    len += snprintf(telemetryLine + len, sizeof(telemetryLine) - len, ",L%d:%d", i, LDR[i]);
+    // use rawPResistorData[i] instead of LDR[i] if you would prefer to see raw photoresistor readings
+
+  if (len < (int)sizeof(telemetryLine))          // error (-3 through 3) and motor outputs (0-255)
+    len += snprintf(telemetryLine + len, sizeof(telemetryLine) - len, ",Err:%.2f,LMotor:%d,RMotor:%d\n",
+                    error, M1SpeedtoMotor, M2SpeedtoMotor);
+  if (len >= (int)sizeof(telemetryLine))
+    len = sizeof(telemetryLine) - 1;
+
+#if USB_PRINT
+  Serial.write((const uint8_t *)telemetryLine, len);
+#endif
+#if BLE_TELEMETRY
+  if (bleWantsData)
+    bleSend(telemetryLine, len);
+#endif
 
 } // end Print()
