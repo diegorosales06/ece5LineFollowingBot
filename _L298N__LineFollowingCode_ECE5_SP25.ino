@@ -37,7 +37,7 @@
 // ************************************************************************************************* //
 // Change Robot Settings here
 
-#define PRINTALLDATA        0  // 1 = send debug data (gains, sensors, error, motor speeds). Safe to leave on untethered:
+#define PRINTALLDATA        1  // 1 = send debug data (gains, sensors, error, motor speeds). Safe to leave on untethered:
                                 //     it is rate-limited and never blocks the PID loop.
 #define USB_PRINT           1  // 1 = also print to the USB Serial Monitor / Serial Plotter (when plugged in)
 #define BLE_TELEMETRY       1  // 1 = also send wirelessly over Bluetooth LE (see BleTelemetry.h / ble_viewer.html)
